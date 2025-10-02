@@ -69,6 +69,7 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3) {
 }
 
 // Helper function to extract subtitles using youtubei library
+// test:    curl "http://localhost:3000/api/extract?videoID=dQw4w9WgXcQ&lang=ko"
 async function extractSubtitlesWithYoutubei(videoID, lang = 'en') {
   try {
     // Initialize YouTube client
@@ -368,10 +369,7 @@ app.get('/api/extract', async (req, res) => {
         result = {
           method: 'youtubei library',
           data: {
-            subtitles: youtubeiResult.subtitles,
-            language: youtubeiResult.language,
-            isAutoTranslated: youtubeiResult.isAutoTranslated,
-            availableLanguages: youtubeiResult.availableLanguages
+            subtitles: youtubeiResult.subtitles
           }
         };
       } catch (youtubeiError) {
@@ -379,14 +377,12 @@ app.get('/api/extract', async (req, res) => {
         
         try {
           const subtitles = await getSubtitles({ videoID, lang });
-          const videoDetails = await getVideoDetails({ videoID, lang });
+          // const videoDetails = await getVideoDetails({ videoID, lang });
           
           result = {
             method: 'youtube-caption-extractor (fallback)',
             data: {
               subtitles,
-              videoDetails,
-              note: 'youtubei library failed, used youtube-caption-extractor as fallback'
             }
           };
         } catch (extractorError) {
@@ -398,8 +394,6 @@ app.get('/api/extract', async (req, res) => {
             method: 'ytdl-core (fallback)',
             data: {
               subtitles: ytdlResult.subtitles,
-              availableLanguages: ytdlResult.availableLanguages,
-              note: 'Both youtubei library and youtube-caption-extractor failed, used ytdl-core as final fallback'
             }
           };
         }
