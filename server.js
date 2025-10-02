@@ -3,6 +3,7 @@ const cors = require('cors');
 const { getSubtitles, getVideoDetails } = require('youtube-caption-extractor');
 const ytdl = require('@distube/ytdl-core');
 const xml2js = require('xml2js');
+const { Innertube } = require('youtubei.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,119 +12,139 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Helper function to extract
-//  subtitles using YouTube InnerTube API v1
-
+// Rate limiting and retry logic
 const userAgents = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
-  'Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
 ];
 
 function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-async function extractSubtitlesWithInnerTube(videoID, lang = 'en') {
-  try {
-    // YouTube InnerTube API v1 endpoint
-    const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player';
-    
-
-    // Required headers and context for InnerTube API
-    const headers = {
-      'Content-Type': 'application/json',
-      'User-Agent': getRandomUserAgent(),
-      'X-YouTube-Client-Name': '1',
-      'X-YouTube-Client-Version': '2.20231219.01.00',
-      'Origin': 'https://www.youtube.com',
-      'Referer': 'https://www.youtube.com/'
-    };
-    
-    // InnerTube API request payload - includes captions and auto-translated captions
-    const payload = {
-      context: {
-        client: {
-          clientName: 'WEB',
-          clientVersion: '2.20231219.01.00',
-          hl: 'en',
-          gl: 'US'
-        }
-      },
-      videoId: videoID
-    };
-    
-    // Make request to InnerTube API
-    const response = await fetch(INNERTUBE_API_URL, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(payload)
-    });
-    
-      if (!response.ok) {
-        console.log('InnerTube API URL:', INNERTUBE_API_URL);
-        console.log('Request payload:', JSON.stringify(payload, null, 2));
-        console.log('Response status:', response.status, response.statusText);
-        const errorText = await response.text();
-        console.log('Error response:', errorText);
-        throw new Error(`InnerTube API request failed: ${response.status} ${response.statusText}`);
+async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Add random delay to avoid rate limiting
+      if (attempt > 1) {
+        const delay = Math.random() * 2000 + 1000; // 1-3 seconds
+        console.log(`Attempt ${attempt}: Waiting ${delay.toFixed(0)}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
+      
+      // Rotate User-Agent for each attempt
+      const headers = {
+        ...options.headers,
+        'User-Agent': getRandomUserAgent()
+      };
+      
+      const response = await fetch(url, {
+        ...options,
+        headers
+      });
+      
+      if (response.status === 429) {
+        if (attempt === maxRetries) {
+          throw new Error(`Rate limited after ${maxRetries} attempts. Please try again later.`);
+        }
+        console.log(`Rate limited (429) on attempt ${attempt}, retrying...`);
+        continue;
+      }
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      return response;
+    } catch (error) {
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      console.log(`Attempt ${attempt} failed: ${error.message}, retrying...`);
+    }
+  }
+}
+
+// Helper function to extract subtitles using youtubei library
+async function extractSubtitlesWithYoutubei(videoID, lang = 'en') {
+  try {
+    // Initialize YouTube client
+    const yt = await Innertube.create();
     
-    const data = await response.json();
-    
+    // Get video info
+    const info = await yt.getInfo(videoID);
+    console.log('Captions:', info.captions);
     // Check if captions are available
-    if (!data.captions || !data.captions.playerCaptionsTracklistRenderer) {
+    if (!info.captions) {
       throw new Error('No captions available for this video');
     }
     
-    const captionRenderer = data.captions.playerCaptionsTracklistRenderer;
-    const captionTracks = captionRenderer.captionTracks || [];
-    const autoGeneratedTracks = captionRenderer.audioTracks || [];
+    // Get caption tracks
+    const captionTracks = info.captions.caption_tracks || [];
+    const translationLanguages = info.captions.translation_languages || [];
+/*     
+    console.log('Caption Tracks:', captionTracks.map(track => ({
+      language: track.language_code,
+      name: track.name?.text || track.language_code,
+      isAutoGenerated: track.kind === 'asr'
+    })));
     
-    // Log only caption tracks and translation languages
-    // console.log('Caption Tracks:', JSON.stringify(captionTracks, null, 2));
-    // console.log('Translation Languages:', JSON.stringify(captionRenderer.translationLanguages, null, 2));
-    
-    // Combine regular captions and auto-generated captions
-    const allTracks = [...captionTracks, ...autoGeneratedTracks];
+    console.log('Translation Languages:', translationLanguages.map(t => t.language_code)); */
     
     // Find the caption track matching the requested language
-    let selectedTrack = allTracks.find(track => track.languageCode === lang);
+    let selectedTrack = captionTracks.find(track => track.language_code === lang);
+    console.log('Selected Track:', selectedTrack);
+/* 
+    using youtubei   
+    const video = await yt.getInfo(videoID);
+    const transcriptInfo = await video.getTranscript();
+    console.log('Transcript Info:', transcriptInfo);
+    const transcript = await transcriptInfo.selectLanguage(lang);
+    console.log('Transcript:', transcript); */
     
+/*     const translatedTranscript =transcript.content.body.initial_segments.map(s => ({
+      start: (s.start_ms / 1000).toFixed(1),
+      dur: ((s.end_ms - s.start_ms) / 1000).toFixed(1),
+      text: s.snippet.text
+    }));
+    console.log('Translated Transcript:', translatedTranscript); */
+
     // If specific language not found, try to auto-translate to the requested language
-    if (!selectedTrack && allTracks.length > 0 && captionRenderer.translationLanguages) {
-      console.log('Available translation languages:', captionRenderer.translationLanguages.map(t => t.languageCode));
-      
+    if (!selectedTrack && captionTracks.length > 0 && translationLanguages.length > 0) {
       // Check if the requested language is available for auto-translation
-      const translationLang = captionRenderer.translationLanguages.find(t => t.languageCode === lang);
+      const translationLang = translationLanguages.find(t => t.language_code === lang);
       if (translationLang) {
         // Find the best base track for translation (prefer non-auto-generated)
-        const baseTrack = allTracks.find(track => track.kind !== 'asr') || allTracks[0];
-        
+        const baseTrack = captionTracks.find(track => track.kind !== 'asr') || captionTracks[0];
+        console.log('Base Track:', baseTrack);
         if (baseTrack) {
           // Create auto-translated track URL by modifying the base URL
           // Keep the original language in lang parameter, add target language in tlang parameter
-          let autoTranslatedUrl = baseTrack.baseUrl;
+          let autoTranslatedUrl = baseTrack.base_url;
           
           // Handle different URL formats
-          if (autoTranslatedUrl.includes('&lang=')) {
-            autoTranslatedUrl = autoTranslatedUrl.replace(
-              /&lang=[^&]*/, 
-              `&lang=${baseTrack.languageCode}&tlang=${lang}`
-            );
-          } else {
-            autoTranslatedUrl += `&lang=${baseTrack.languageCode}&tlang=${lang}`;
-          }
+         // if (autoTranslatedUrl.includes('&lang=')) {
+         //   autoTranslatedUrl = autoTranslatedUrl.replace(
+         //     /&lang=[^&]*/, 
+         //     `&lang=${baseTrack.language_code}&tlang=${lang}&fmt=json3`
+         //   );
+         // } else {
+         //   autoTranslatedUrl += `&lang=${baseTrack.language_code}&tlang=${lang}&fmt=json3`;
+         // }
           
           selectedTrack = {
             ...baseTrack,
-            languageCode: lang,
-            baseUrl: autoTranslatedUrl,
-            name: { simpleText: `${translationLang.languageName} (Auto-translated)` },
-            kind: 'asr_auto_translated'
+            language_code: lang,
+            name: { text: `${translationLang.language_name} (Auto-translated)` },
+            kind: 'asr_auto_translated',
+            base_url: autoTranslatedUrl
           };
-          console.log(`Language ${lang} not available, auto-translating from ${baseTrack.languageCode}`);
+          console.log(`Language ${lang} not available, auto-translating from ${baseTrack.language_code}`);
+          console.log('Auto-translated URL:', autoTranslatedUrl);
+          
         }
       } else {
         console.log(`Language ${lang} not available for auto-translation`);
@@ -131,84 +152,110 @@ async function extractSubtitlesWithInnerTube(videoID, lang = 'en') {
     }
     
     // If still no track found, use the first available track
-    if (!selectedTrack && allTracks.length > 0) {
-      selectedTrack = allTracks[0];
-      console.log(`Language ${lang} not available and no auto-translation, using ${selectedTrack.languageCode}`);
+    if (!selectedTrack && captionTracks.length > 0) {
+      selectedTrack = captionTracks[0];
+      console.log(`Language ${lang} not available and no auto-translation, using ${selectedTrack.language_code}`);
     }
     
     if (!selectedTrack) {
       throw new Error(`No captions available in the requested language: ${lang}`);
     }
     
-    // Fetch the caption content
-    const captionResponse = await fetch(selectedTrack.baseUrl, {
-      headers: {
-        'User-Agent': getRandomUserAgent(),
+    // Get caption content
+    let captionContent;
+    if (selectedTrack.kind === 'asr_auto_translated') {
+      // For auto-translated tracks, fetch from the modified URL with retry logic
+      const headers = {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com'
-      }
-    });
-    if (!captionResponse.ok) {
-      console.log('Failed to fetch caption content:', selectedTrack.baseUrl);
-      throw new Error(`Failed to fetch caption content: ${captionResponse.status}`);
+        'Origin': 'https://www.youtube.com',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'User-Agent': getRandomUserAgent()
+      };
+      
+      // Print curl command for debugging
+      const curlCommand = `curl -X GET "${selectedTrack.base_url}" \\
+  -H "Accept: application/json, text/plain, */*" \\
+  -H "Accept-Language: en-US,en;q=0.9" \\
+  -H "Referer: https://www.youtube.com/" \\
+  -H "Origin: https://www.youtube.com" \\
+  -H "Cache-Control: no-cache" \\
+  -H "Pragma: no-cache" \\
+  -H "User-Agent: ${headers['User-Agent']}"`;
+      /* 
+      console.log('Curl command for auto-translated captions:');
+      console.log(curlCommand);
+      console.log(''); */
+      
+      const response = await fetch(selectedTrack.base_url, { headers });
+      
+      // Response is already checked in fetchWithRetry
+      
+      const captionText = await response.text();
+      
+      // Parse XML caption format
+      const parser = new xml2js.Parser();
+      const result = await parser.parseStringPromise(captionText);
+      
+      // Convert to youtubei.js format
+      captionContent = {
+        segments: result.transcript?.text?.map((element, index) => ({
+          start_time: parseFloat(element.$.start || '0'),
+          end_time: parseFloat(element.$.start || '0') + parseFloat(element.$.dur || '0'),
+          snippet: {
+            text: String(element._ || element || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          }
+        })) || []
+      };
+    } else {
+      // For regular tracks, use youtubei.js fetch method
+      captionContent = await selectedTrack.fetch();
     }
     
-    const captionText = await captionResponse.text();
-    
-    // Parse XML caption format
-    const parser = new xml2js.Parser();
-    const result = await parser.parseStringPromise(captionText);
-    
+    // Parse caption content
     const subtitles = [];
-    if (result.transcript && result.transcript.text) {
-      console.log("transcript result", result);
-      result.transcript.text.forEach((element, index) => {
-        const start = element.$.start || '0';
-        const dur = element.$.dur || '0';
-        const text = element._ || element || '';
-        
+    if (captionContent && captionContent.segments) {
+      captionContent.segments.forEach((segment) => {
         subtitles.push({
-          start: parseFloat(start).toFixed(1),
-          dur: parseFloat(dur).toFixed(1),
-          text: String(text || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          start: segment.start_time.toFixed(1),
+          dur: segment.end_time ? (segment.end_time - segment.start_time).toFixed(1) : '0.0',
+          text: segment.snippet?.text || ''
         });
       });
     }
-    
+    /* 
     // Get all available languages including auto-translation options
-    const availableLanguages = allTracks.map(track => ({
-      code: track.languageCode,
-      name: track.name?.simpleText || track.languageCode,
-      isAutoGenerated: track.kind === 'asr' || track.kind === 'asr_auto',
+    const availableLanguages = captionTracks.map(track => ({
+      code: track.language_code,
+      name: track.name?.text || track.language_code,
+      isAutoGenerated: track.kind === 'asr',
       isAutoTranslated: false
     }));
-
+    
     // Add auto-translation options if available
-    if (captionRenderer.translationLanguages) {
-      captionRenderer.translationLanguages.forEach(translationLang => {
-        // Only add if not already in the list
-        if (!availableLanguages.find(lang => lang.code === translationLang.languageCode)) {
-          availableLanguages.push({
-            code: translationLang.languageCode,
-            name: `${translationLang.languageName} (Auto-translated)`,
-            isAutoGenerated: false,
-            isAutoTranslated: true
-          });
-        }
-      });
-    }
+    translationLanguages.forEach(translationLang => {
+      // Only add if not already in the list
+      if (!availableLanguages.find(lang => lang.code === translationLang.language_code)) {
+        availableLanguages.push({
+          code: translationLang.language_code,
+          name: `${translationLang.language_name} (Auto-translated)`,
+          isAutoGenerated: false,
+          isAutoTranslated: true
+        });
+      }
+    }); */
 
     return {
       subtitles,
-      language: selectedTrack.languageCode,
-      method: 'InnerTube API v1',
+      language: selectedTrack.language_code,
+      method: 'youtubei library',
       isAutoTranslated: selectedTrack.kind === 'asr_auto_translated',
-      availableLanguages
+     // availableLanguages
     };
   } catch (error) {
-    throw new Error(`InnerTube API v1 extraction failed: ${error.message}`);
+    throw new Error(`youtubei library extraction failed: ${error.message}`);
   }
 }
 
@@ -278,8 +325,20 @@ app.get('/api/extract', async (req, res) => {
   try {
     let result = {};
     
-    // Try InnerTube API v1 first (unless specific method is requested)
-    if (method === 'ytdl') {
+    // Try youtubei library first (unless specific method is requested)
+    if (method === 'youtubei') {
+      // Use youtubei library directly
+      const youtubeiResult = await extractSubtitlesWithYoutubei(videoID, lang);
+      result = {
+        method: 'youtubei library',
+        data: {
+          subtitles: youtubeiResult.subtitles,
+          language: youtubeiResult.language,
+          isAutoTranslated: youtubeiResult.isAutoTranslated,
+          availableLanguages: youtubeiResult.availableLanguages
+        }
+      };
+    } else if (method === 'ytdl') {
       // Use ytdl-core directly
       const ytdlResult = await extractSubtitlesWithYtdl(videoID, lang);
       result = {
@@ -302,21 +361,21 @@ app.get('/api/extract', async (req, res) => {
         }
       };
     } else {
-      // Default: Try InnerTube API v1 first, then fallback chain
+      // Default: Try youtubei library first, then fallback chain
       try {
-        const innerTubeResult = await extractSubtitlesWithInnerTube(videoID, lang);
+        const youtubeiResult = await extractSubtitlesWithYoutubei(videoID, lang);
         
         result = {
-          method: 'InnerTube API v1',
+          method: 'youtubei library',
           data: {
-            subtitles: innerTubeResult.subtitles,
-            language: innerTubeResult.language,
-            isAutoTranslated: innerTubeResult.isAutoTranslated,
-            availableLanguages: innerTubeResult.availableLanguages
+            subtitles: youtubeiResult.subtitles,
+            language: youtubeiResult.language,
+            isAutoTranslated: youtubeiResult.isAutoTranslated,
+            availableLanguages: youtubeiResult.availableLanguages
           }
         };
-      } catch (innerTubeError) {
-        console.log('InnerTube API v1 failed, trying youtube-caption-extractor:', innerTubeError.message);
+      } catch (youtubeiError) {
+        console.log('youtubei library failed, trying youtube-caption-extractor:', youtubeiError.message);
         
         try {
           const subtitles = await getSubtitles({ videoID, lang });
@@ -327,7 +386,7 @@ app.get('/api/extract', async (req, res) => {
             data: {
               subtitles,
               videoDetails,
-              note: 'InnerTube API v1 failed, used youtube-caption-extractor as fallback'
+              note: 'youtubei library failed, used youtube-caption-extractor as fallback'
             }
           };
         } catch (extractorError) {
@@ -340,7 +399,7 @@ app.get('/api/extract', async (req, res) => {
             data: {
               subtitles: ytdlResult.subtitles,
               availableLanguages: ytdlResult.availableLanguages,
-              note: 'Both InnerTube API v1 and youtube-caption-extractor failed, used ytdl-core as final fallback'
+              note: 'Both youtubei library and youtube-caption-extractor failed, used ytdl-core as final fallback'
             }
           };
         }
